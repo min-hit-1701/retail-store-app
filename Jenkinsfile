@@ -1,4 +1,4 @@
-// ============================================================
+﻿// ============================================================
 // Jenkinsfile — DevSecOps CI Pipeline
 // Do an: DevSecOps + GitOps cho Microservices tren AWS
 // ============================================================
@@ -9,7 +9,7 @@ pipeline {
     environment {
         // AWS & ECR
         AWS_REGION             = 'ap-southeast-1'
-        AWS_ACCOUNT_ID         = '758346258990'
+        AWS_ACCOUNT_ID         = '<AWS_ACCOUNT_ID>'
         ECR_BASE_URL           = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
         ENVIRONMENT_NAME       = 'uit-devsecops-dev'
 
