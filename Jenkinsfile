@@ -1,16 +1,27 @@
 // ============================================================
 // Jenkinsfile — DevSecOps CI Pipeline
 // Capstone Project: DevSecOps + GitOps for Microservices on AWS
+//
+// Prerequisites (Jenkins Credentials):
+//   aws-credentials    — AWS IAM credentials (type: AWS Credentials)
+//   OWASP_NVD_API_KEY  — NVD API key (type: Secret text)
+//   gitops-deploy-key  — SSH key for GitOps repo push (type: SSH)
+//   SonarQube          — SonarQube server token (configured in Jenkins system)
+//
+// Required Jenkins Plugins:
+//   - CloudBees AWS Credentials Plugin
+//   - Amazon ECR Plugin
+//   - Docker Pipeline Plugin
+//   - SonarQube Scanner Plugin
+//   - SSH Agent Plugin
 // ============================================================
 
 pipeline {
     agent any
 
     environment {
-        // AWS & ECR
         AWS_REGION             = 'ap-southeast-1'
-        AWS_ACCOUNT_ID         = '758346258990'
-        ECR_BASE_URL           = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        AWS_CREDENTIALS_ID     = 'aws-credentials'
         ENVIRONMENT_NAME       = 'uit-devsecops-dev'
 
         // Git repos
@@ -41,6 +52,28 @@ pipeline {
     }
 
     stages {
+
+        // ------------------------------------------------------------------
+        // Stage 0: Resolve AWS Account ID dynamically
+        // ------------------------------------------------------------------
+        stage('AWS Setup') {
+            steps {
+                withAWS(region: "${AWS_REGION}", credentials: "${AWS_CREDENTIALS_ID}") {
+                    script {
+                        def accountId = sh(
+                            script: 'aws sts get-caller-identity --query Account --output text',
+                            returnStdout: true
+                        ).trim()
+
+                        env.AWS_ACCOUNT_ID = accountId
+                        env.ECR_BASE_URL   = "${accountId}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+                        echo "AWS Account: ${accountId}"
+                        echo "ECR Registry: ${env.ECR_BASE_URL}"
+                    }
+                }
+            }
+        }
 
         // ------------------------------------------------------------------
         // Stage 1: Checkout
@@ -95,8 +128,6 @@ pipeline {
                 script {
                     echo "=== SECURITY GATE 1: SonarQube Static Analysis ==="
 
-                    // Run SonarQube analysis
-                    // SonarQube scanner reads sonar-project.properties in root
                     withSonarQubeEnv('SonarQube') {
                         sh '''
                             sonar-scanner \
@@ -138,8 +169,6 @@ pipeline {
                     echo "=== SECURITY GATE 2: OWASP Dependency Check ==="
 
                     sh '''
-                        # Run OWASP Dependency Check
-                        # Scans all dependency manifests in the project
                         /opt/dependency-check/bin/dependency-check.sh \
                             --scan src/ \
                             --format HTML \
@@ -147,9 +176,8 @@ pipeline {
                             --out dependency-check-report \
                             --failOnCVSS 7 \
                             --nvdApiKey ${OWASP_NVD_API_KEY} \
-                            || true  # Don't fail immediately, check report below
+                            || true
 
-                        # Parse JSON report for HIGH/CRITICAL CVE count
                         HIGH_COUNT=$(python3 -c "
 import json
 with open('dependency-check-report/dependency-check-report.json') as f:
@@ -175,125 +203,75 @@ print(count)
         }
 
         // ------------------------------------------------------------------
-        // Stage 5: Docker Build all images (parallel)
+        // Stage 5: Docker Build + Push + Trivy Scan (all parallel)
         // ------------------------------------------------------------------
-        stage('Docker Build') {
+        stage('Docker Build & Push') {
             steps {
-                script {
-                    // Login to ECR
-                    sh '''
-                        aws ecr get-login-password --region ${AWS_REGION} \
-                            | docker login --username AWS --password-stdin ${ECR_BASE_URL}
-                    '''
+                withAWS(region: "${AWS_REGION}", credentials: "${AWS_CREDENTIALS_ID}") {
+                    script {
+                        docker.withRegistry(
+                            "https://${env.ECR_BASE_URL}",
+                            "ecr:${AWS_REGION}:${AWS_CREDENTIALS_ID}"
+                        ) {
+                            def buildSteps = [:]
+                            def services = env.SERVICES.split(',')
 
-                    def buildSteps = [:]
-                    def services = env.SERVICES.split(',')
+                            services.each { service ->
+                                def svc = service.trim()
+                                def imageName = "${env.ENVIRONMENT_NAME}-${svc}"
+                                def fullName  = "${env.ECR_BASE_URL}/${imageName}"
+                                def dockerfilePath = "src/${svc}/Dockerfile"
 
-                    services.each { service ->
-                        def svc = service.trim()
-                        def imageName = "${env.ECR_BASE_URL}/${env.ENVIRONMENT_NAME}-${svc}:${env.IMAGE_TAG}"
-                        def dockerfilePath = "src/${svc}/Dockerfile"
+                                buildSteps[svc] = {
+                                    if (fileExists(dockerfilePath)) {
+                                        def taggedImage = docker.build(
+                                            "${imageName}:${env.IMAGE_TAG}",
+                                            "-f ${dockerfilePath} src/${svc}/"
+                                        )
+                                        sh "docker tag ${imageName}:${env.IMAGE_TAG} ${fullName}:${env.IMAGE_TAG}"
+                                        sh "docker tag ${imageName}:${env.IMAGE_TAG} ${fullName}:latest"
 
-                        buildSteps[svc] = {
-                            script {
-                                if (fileExists(dockerfilePath)) {
-                                    sh "docker build -t ${imageName} -f ${dockerfilePath} src/${svc}/"
-                                    sh "docker tag ${imageName} ${env.ECR_BASE_URL}/${env.ENVIRONMENT_NAME}-${svc}:latest"
-                                    echo "Built: ${imageName}"
-                                } else {
-                                    error "Dockerfile not found: ${dockerfilePath}"
-                                }
-                            }
-                        }
-                    }
+                                        // SECURITY GATE 3: Trivy scan
+                                        sh """
+                                            trivy image --severity ${TRIVY_SEVERITY} \
+                                                --format json \
+                                                --output trivy-report-${svc}.json \
+                                                --exit-code 0 \
+                                                ${fullName}:${env.IMAGE_TAG}
 
-                    parallel buildSteps
-                }
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // Stage 6: SECURITY GATE 3 — Trivy Container Image Scan
-        // ------------------------------------------------------------------
-        stage('Trivy Image Scan') {
-            steps {
-                script {
-                    echo "=== SECURITY GATE 3: Trivy Image Scan ==="
-
-                    def scanSteps = [:]
-                    def services = env.SERVICES.split(',')
-
-                    services.each { service ->
-                        def svc = service.trim()
-                        def imageName = "${env.ECR_BASE_URL}/${env.ENVIRONMENT_NAME}-${svc}:${env.IMAGE_TAG}"
-
-                        scanSteps[svc] = {
-                            def result = sh(
-                                script: """
-                                    trivy image --severity ${TRIVY_SEVERITY} \
-                                        --format json \
-                                        --output trivy-report-${svc}.json \
-                                        --exit-code 0 \
-                                        ${imageName}
-
-                                    # Check for CRITICAL vulnerabilities
-                                    CRIT_COUNT=\$(python3 -c "
+                                            CRIT_COUNT=\$(python3 -c "
 import json
 with open('trivy-report-${svc}.json') as f:
     data = json.load(f)
 count = sum(1 for r in data.get('Results', []) for v in r.get('Vulnerabilities', []) if v.get('Severity') == 'CRITICAL')
 print(count)
-                                    ")
-                                    echo "${svc}: \${CRIT_COUNT} CRITICAL vulnerabilities"
+                                            ")
+                                            echo "${svc}: \${CRIT_COUNT} CRITICAL vulnerabilities"
 
-                                    if [ "\${CRIT_COUNT}" -gt 0 ]; then
-                                        echo "Trivy found CRITICAL vulnerabilities in ${svc}"
-                                        exit 1
-                                    fi
-                                """,
-                                returnStatus: true
-                            )
+                                            if [ "\${CRIT_COUNT}" -gt 0 ]; then
+                                                echo "Trivy found CRITICAL vulnerabilities in ${svc}"
+                                                exit 1
+                                            fi
+                                        """
 
-                            if (result != 0) {
-                                error "Image ${imageName} has CRITICAL vulnerabilities"
+                                        docker.image(fullName).push(env.IMAGE_TAG)
+                                        docker.image(fullName).push('latest')
+                                        echo "Built + Scanned + Pushed: ${fullName}:${env.IMAGE_TAG}"
+                                    } else {
+                                        error "Dockerfile not found: ${dockerfilePath}"
+                                    }
+                                }
                             }
+
+                            parallel buildSteps
                         }
                     }
-
-                    parallel scanSteps
                 }
             }
         }
 
         // ------------------------------------------------------------------
-        // Stage 7: Push to ECR
-        // ------------------------------------------------------------------
-        stage('Push to ECR') {
-            steps {
-                script {
-                    echo "Pushing images to ECR..."
-
-                    def pushSteps = [:]
-                    def services = env.SERVICES.split(',')
-
-                    services.each { service ->
-                        def svc = service.trim()
-                        def imageName = "${env.ECR_BASE_URL}/${env.ENVIRONMENT_NAME}-${svc}"
-
-                        pushSteps[svc] = {
-                            sh "docker push ${imageName}:${env.IMAGE_TAG}"
-                            sh "docker push ${imageName}:latest"
-                            echo "Pushed: ${imageName}:${env.IMAGE_TAG}"
-                        }
-                    }
-
-                    parallel pushSteps
-                }
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // Stage 8: Update GitOps Repo
+        // Stage 6: Update GitOps Repo
         // ------------------------------------------------------------------
         stage('Update GitOps Repo') {
             steps {
@@ -302,20 +280,16 @@ print(count)
 
                     sshagent(['gitops-deploy-key']) {
                         sh '''
-                            # Clone GitOps repo
                             git clone ${GITOPS_REPO_URL} ${GITOPS_REPO_PATH}
                             cd ${GITOPS_REPO_PATH}
 
-                            # Update image tags in all overlay kustomization.yaml files
                             SERVICES="ui cart orders catalog checkout"
                             for svc in $SERVICES; do
                                 IMAGE="${ECR_BASE_URL}/${ENVIRONMENT_NAME}-${svc}"
                                 echo "Updating ${svc} to tag ${IMAGE_TAG}..."
 
-                                # Find kustomization.yaml files and update newTag
                                 find apps/ -name kustomization.yaml | while read f; do
                                     if grep -q "name: ${svc}" "$f" 2>/dev/null; then
-                                        # Use sed to update newTag for the matching image
                                         python3 -c "
 import yaml, sys
 with open('${f}', 'r') as file:
@@ -332,11 +306,9 @@ with open('${f}', 'w') as file:
                                 done
                             done
 
-                            # Configure git and commit
                             git config user.email "ci-bot@devsecops.local"
                             git config user.name "CI Bot"
 
-                            # Only commit if there are changes
                             if ! git diff --quiet; then
                                 git add .
                                 git commit -m "ci: update image tags to ${IMAGE_TAG} [skip ci]"
@@ -358,7 +330,6 @@ with open('${f}', 'w') as file:
     post {
         always {
             script {
-                // Clean up Docker images to save disk space
                 sh '''
                     SERVICES="ui cart orders catalog checkout"
                     for svc in $SERVICES; do
@@ -369,7 +340,6 @@ with open('${f}', 'w') as file:
                 '''
             }
 
-            // Archive reports
             archiveArtifacts artifacts: '**/trivy-report-*.json', allowEmptyArchive: true
             archiveArtifacts artifacts: '**/dependency-check-report/*.html', allowEmptyArchive: true
         }
